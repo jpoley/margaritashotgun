@@ -1,19 +1,21 @@
 import argparse
+import copy
 import logging
 import os
 import yaml
 from yaml import YAMLError
+from margaritashotgun import __version__
 from margaritashotgun.exceptions import *
-
+from margaritashotgun.settings import *
 logger = logging.getLogger(__name__)
 
 default_allowed_keys = ["aws", "hosts", "workers", "logging", "repository"]
 aws_allowed_keys = ["bucket"]
 host_allowed_keys = ["addr", "port", "username", "password",
-                     "module", "key", "filename", "jump_host"]
+                    "module", "key", "filename", "jump_host"]
 jump_host_allowed_keys = ["addr", "port", "username", "password", "key"]
 logging_allowed_keys = ["dir", "prefix"]
-repository_allowed_keys = ["enabled", "url"]
+repository_allowed_keys = ["enabled", "url", "gpg_verify", "manifest"]
 default_host_config = dict(zip(host_allowed_keys,
                                [None]*len(host_allowed_keys)))
 default_jump_host_config = dict(zip(jump_host_allowed_keys,
@@ -26,7 +28,9 @@ default_config = {"aws": {"bucket": None},
                       "prefix": None},
                   "repository": {
                       "enabled": False,
-                      "url": "https://threatresponse-lime-modules.s3.amazonaws.com/"
+                      "url": REPOSITORY_BUCKET_URI,
+                      "gpg_verify": True,
+                      "manifest": "primary"
                   }}
 
 
@@ -50,18 +54,19 @@ class Cli():
         root.add_argument('-c', '--config', help='path to config.yml')
         root.add_argument('--server',
                           help='hostname or ip of target server')
-        root.add_argument('--version', action='store_true',
-                          help='show version')
+        root.add_argument('--version', action='version',
+                          version="%(prog)s {ver}".format(ver=__version__))
 
         opts = parser.add_argument_group()
         opts.add_argument('--port', help='ssh port on remote server')
         opts.add_argument('--username',
                           help='username for ssh connection to target server')
-        opts.add_argument('-m', '--module', help='path to lime kernel module')
+        opts.add_argument('--module',
+                          help='path to kernel lime kernel module')
         opts.add_argument('--password',
                           help='password for user or encrypted keyfile')
-        opts.add_argument('-k', '--key',
-                          help='path to rsa key for ssh connection to target server')
+        opts.add_argument('--key',
+                          help='path to rsa key for ssh connection')
         opts.add_argument('--jump-server',
                           help='hostname or ip of jump server')
         opts.add_argument('--jump-port',
@@ -72,26 +77,37 @@ class Cli():
                           help='password for jump-user or encrypted keyfile')
         opts.add_argument('--jump-key',
                           help='path to rsa key for ssh connection to jump server')
-        opts.add_argument('-f', '--filename',
+        opts.add_argument('--filename',
                           help='memory dump filename')
         opts.add_argument('--repository', action='store_true',
                           help='enable automatic kernel module downloads')
         opts.add_argument('--repository-url',
-                          help='repository url')
-        opts.add_argument('-w', '--workers', default=1,
+                          help='kernel module repository url')
+        opts.add_argument('--repository-manifest',
+                          help='specify alternate repository manifest')
+        opts.add_argument('--gpg-no-verify', dest='gpg_verify',
+                          action='store_false',
+                          help='skip lime module gpg signature check')
+        opts.add_argument('--workers', default=1,
                           help=('number of workers to run in parallel,'
                                 'default: auto acceptable values are'
                                 '(INTEGER | "auto")'))
         opts.add_argument('--verbose', action='store_true',
                           help='log debug messages')
+        opts.set_defaults(repository_manifest='primary')
+        opts.set_defaults(gpg_verify=True)
 
         output = parser.add_mutually_exclusive_group(required=False)
-        output.add_argument('-b', '--bucket',
+        output.add_argument('--bucket',
                             help='memory dump output bucket')
+        output.add_argument('--output-dir',
+                            help='memory dump output directory')
 
         log = parser.add_argument_group()
-        log.add_argument('--log-dir', help='log directory')
-        log.add_argument('--log-prefix', help='log file prefix')
+        log.add_argument('--log-dir',
+                         help='log directory')
+        log.add_argument('--log-prefix',
+                         help='log file prefix')
         return parser.parse_args(args)
 
     def configure(self, arguments=None, config=None):
@@ -106,10 +122,12 @@ class Cli():
 
         if arguments is not None:
             args_config = self.configure_args(arguments)
-            working_config = self.merge_config(default_config, args_config)
+            base_config = copy.deepcopy(default_config)
+            working_config = self.merge_config(base_config, args_config)
         if config is not None:
             self.validate_config(config)
-            working_config = self.merge_config(default_config, config)
+            base_config = copy.deepcopy(default_config)
+            working_config = self.merge_config(base_config, config)
 
         # override configuration with environment variables
         repo = self.get_env_default('LIME_REPOSITORY', 'disabled')
@@ -125,34 +143,27 @@ class Cli():
     def merge_config(self, base, config):
         """
         """
-
-        for key in config:
-            if key in base:
-                # iterate through hosts and merge against default_host_config
-                if isinstance(config[key], list) and key == 'hosts':
-                    hosts = []
-                    for host in config[key]:
-                        hosts.append(self.merge_config(default_host_config,
-                                                       host))
-                    base[key] = hosts
-                # merge 'jump_host' dict against default_jump_host_config
-                elif isinstance(config[key], dict) and key == 'jump_host':
-                    # only merge with default if jump_host has a value
-                    if config[key] is not None:
-                        base[key] = self.merge_config(default_jump_host_config,
-                                                      config[key])
-                    else:
-                        base[key] = config[key]
-                # recursively merge dictionaries against the base config
-                elif isinstance(base[key], dict) and isinstance(config[key], dict):
-                    base[key] = self.merge_config(base[key], config[key])
-                # store user leaf nodes in the base config
+        for key, value in config.items():
+            # Merge dictionaries into the default config
+            if isinstance(value, dict):
+                # use jump_host specific default config
+                if key == 'jump_host':
+                    jump_host_config = copy.deepcopy(default_jump_host_config)
+                    base[key] = self.merge_config(jump_host_config, value)
                 else:
-                    base[key] = config[key]
+                    node = base.setdefault(key, {})
+                    self.merge_config(node, value)
+            # Iterate over host lists, merging with the host default config
+            elif isinstance(value, list):
+                merged_list = []
+                for item in value:
+                    host_config = copy.deepcopy(default_host_config)
+                    merged_list.append(self.merge_config(host_config, item))
+                base[key] = merged_list
+            # Set any user supplied value in the default config
             else:
-                reason = ("{0} key in user config but not in base. base "
-                          "config keys: {1}".format(key, base.keys()))
-                raise ConfigurationMergeError(reason)
+                base[key] = value
+
         return base
 
     def get_env_default(self, variable, default):
@@ -188,7 +199,9 @@ class Cli():
                                         prefix=arguments.log_prefix),
                            workers=arguments.workers,
                            repository=dict(enabled=arguments.repository,
-                                           url=url))
+                                           url=url,
+                                           manifest=arguments.repository_manifest,
+                                           gpg_verify=arguments.gpg_verify))
 
         if arguments.server is not None:
 
@@ -302,8 +315,8 @@ class Cli():
             hosts = config['hosts']
         except KeyError:
             raise InvalidConfigurationError('hosts', "",
-                                            reason=('hosts configuration section'
-                                                    'is required'))
+                                            reason=('hosts configuration '
+                                                    'section is required'))
 
         for key in config.keys():
             if key not in default_allowed_keys:

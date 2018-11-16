@@ -1,5 +1,5 @@
 import paramiko
-from paramiko import AuthenticationException, SSHException
+from paramiko import AuthenticationException, SSHException, ChannelException
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
 from socket import error as SocketError
@@ -14,7 +14,7 @@ class Commands(Enum):
     mem_size = "cat /proc/meminfo | grep MemTotal | awk '{ print $2 }'"
     kernel_version = "uname -r"
     lime_pattern = "{0}:{1}"
-    lime_check = "netstat -lnt | grep {0}"
+    lime_check = "cat /proc/net/tcp"
     load_lime = 'sudo insmod {0} "path=tcp:{1}" format={2}'
     unload_lime = "sudo pkill insmod; sudo rmmod lime"
 
@@ -45,44 +45,46 @@ class RemoteShell():
         :param port: remote server port
         """
 
-        self.target_address = address
-        sock = None
-        if jump_host is not None:
-            self.jump_host_ssh = paramiko.SSHClient()
-            self.jump_host_ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.connect_with_auth(self.jump_host_ssh, jump_auth,
-                                   jump_host['addr'], jump_host['port'], sock)
-            transport = self.jump_host_ssh.get_transport()
-            dest_addr = (address, port)
-            jump_addr = (jump_host['addr'], jump_host['port'])
-            channel = transport.open_channel('direct-tcpip', dest_addr,
-                                             jump_addr)
-            self.connect_with_auth(self.ssh, auth, address, port, channel)
-        else:
-            self.connect_with_auth(self.ssh, auth, address, port, sock)
+        try:
+            self.target_address = address
+            sock = None
+            if jump_host is not None:
+                self.jump_host_ssh = paramiko.SSHClient()
+                self.jump_host_ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                self.connect_with_auth(self.jump_host_ssh, jump_auth,
+                                       jump_host['addr'], jump_host['port'], sock)
+                transport = self.jump_host_ssh.get_transport()
+                dest_addr = (address, port)
+                jump_addr = (jump_host['addr'], jump_host['port'])
+                channel = transport.open_channel('direct-tcpip', dest_addr,
+                                                 jump_addr)
+                self.connect_with_auth(self.ssh, auth, address, port, channel)
+            else:
+                self.connect_with_auth(self.ssh, auth, address, port, sock)
+        except (AuthenticationException, SSHException,
+                ChannelException, SocketError) as ex:
+            raise SSHConnectionError("{0}:{1}".format(address, port), ex)
 
     def connect_with_auth(self, ssh, auth, address, port, sock):
         """
         """
-        try:
-            logger.debug(("{0}: paramiko client connecting to "
-                          "{0}:{1} with {2}".format(address,
-                                                    port,
-                                                    auth.method)))
-            if auth.method == AuthMethods.key:
-                self.connect_with_key(ssh, auth.username, auth.key, address,
-                                      port, sock)
-            elif auth.method == AuthMethods.password:
-                self.connect_with_password(ssh, auth.username, auth.password,
-                                           address, port, sock)
-            else:
-                raise AuthenticationMethodMissingError()
-            logger.debug(("{0}: paramiko client connected to "
-                          "{0}:{1}".format(address, port)))
-        except (AuthenticationException, SSHException, SocketError) as ex:
-            raise SSHConnectionError("{0}:{1}".format(address, port), ex)
+        logger.debug(("{0}: paramiko client connecting to "
+                      "{0}:{1} with {2}".format(address,
+                                                port,
+                                                auth.method)))
+        if auth.method == AuthMethods.key:
+            self.connect_with_key(ssh, auth.username, auth.key, address,
+                                  port, sock)
+        elif auth.method == AuthMethods.password:
+            self.connect_with_password(ssh, auth.username, auth.password,
+                                       address, port, sock)
+        else:
+            raise AuthenticationMethodMissingError()
+        logger.debug(("{0}: paramiko client connected to "
+                      "{0}:{1}".format(address, port)))
 
-    def connect_with_password(self, ssh, username, password, address, port, sock):
+    def connect_with_password(self, ssh, username, password, address, port, sock,
+                              timeout=20):
         """
         Create an ssh session to a remote host with a username and password
 
@@ -99,9 +101,11 @@ class RemoteShell():
                     password=password,
                     hostname=address,
                     port=port,
-                    sock=sock)
+                    sock=sock,
+                    timeout=timeout)
 
-    def connect_with_key(self, ssh, username, key, address, port, sock):
+    def connect_with_key(self, ssh, username, key, address, port, sock,
+                         timeout=20):
         """
         Create an ssh session to a remote host with a username and rsa key
 
@@ -118,9 +122,15 @@ class RemoteShell():
                     port=port,
                     username=username,
                     pkey=key,
-                    sock=sock)
+                    sock=sock,
+                    timeout=timeout)
 
     def transport(self):
+        transport = self.ssh.get_transport()
+        transport.use_compression(True)
+        transport.window_size = 2147483647
+        transport.packetizer.REKEY_BYTES = pow(2, 40)
+        transport.packetizer.REKEY_PACKETS = pow(2, 40)
         return self.ssh.get_transport()
 
     def execute(self, command):
@@ -130,11 +140,22 @@ class RemoteShell():
         :type command: str
         :param command: command to be run on remote host
         """
-        logger.debug('{0}: executing "{1}"'.format(self.target_address,
-                                                   command))
-        stdin, stdout, stderr = self.ssh.exec_command(command)
-        return dict(zip(['stdin', 'stdout', 'stderr'],
-                        [stdin, stdout, stderr]))
+        try:
+            if self.ssh.get_transport() is not None:
+                logger.debug('{0}: executing "{1}"'.format(self.target_address,
+                                                           command))
+                stdin, stdout, stderr = self.ssh.exec_command(command)
+                return dict(zip(['stdin', 'stdout', 'stderr'],
+                                [stdin, stdout, stderr]))
+            else:
+                raise SSHConnectionError(self.target_address,
+                                         "ssh transport is closed")
+        except (AuthenticationException, SSHException,
+                ChannelException, SocketError) as ex:
+            logger.critical(("{0} execution failed on {1} with exception:"
+                             "{2}".format(command, self.target_address,
+                                               ex)))
+            raise SSHCommandError(self.target_address, command, ex)
 
     def execute_async(self, command, callback=None):
         """
@@ -145,14 +166,21 @@ class RemoteShell():
         :type callback: function
         :param callback: function to call when execution completes
         """
-        logger.debug(('{0}: execute async "{1}"'
-                      'with callback {2}'.format(self.target_address,
-                                                 command,
-                                                 callback)))
-        future = self.executor.submit(self.execute, command)
-        if callback is not None:
-            future.add_done_callback(callback)
-        return future
+        try:
+            logger.debug(('{0}: execute async "{1}"'
+                          'with callback {2}'.format(self.target_address,
+                                                     command,
+                                                     callback)))
+            future = self.executor.submit(self.execute, command)
+            if callback is not None:
+                future.add_done_callback(callback)
+            return future
+        except (AuthenticationException, SSHException,
+                ChannelException, SocketError) as ex:
+            logger.critical(("{0} execution failed on {1} with exception:"
+                             "{2}".format(command, self.target_address,
+                                               ex)))
+            raise SSHCommandError(self.target_address, command, ex)
 
     def decode(self, stream, encoding='utf-8'):
         """
@@ -182,7 +210,7 @@ class RemoteShell():
                                                             local_path,
                                                             remote_path))
         try:
-            sftp = self.ssh.open_sftp()
+            sftp = paramiko.SFTPClient.from_transport(self.transport())
             sftp.put(local_path, remote_path)
             sftp.close()
         except SSHException as ex:
@@ -196,4 +224,5 @@ class RemoteShell():
         for future in self.futures:
             future.cancel()
         self.executor.shutdown(wait=10)
-        self.ssh.close()
+        if self.ssh.get_transport() != None:
+            self.ssh.close()

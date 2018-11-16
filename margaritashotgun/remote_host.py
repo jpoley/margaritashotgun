@@ -10,14 +10,13 @@ from margaritashotgun.remote_shell import RemoteShell, Commands
 from margaritashotgun.ssh_tunnel import SSHTunnel
 from margaritashotgun.repository import Repository
 from margaritashotgun.memory import Memory, OutputDestinations
+from margaritashotgun.util import parser
 
 try:
     from logging.handlers import QueueHandler
 except ImportError:
     from logutils.queue import QueueHandler
 
-# TODO: add config item to resolve modules automatically
-# TODO: add config item repository url (only suports s3 bucket for now
 
 def _init(queue):
     global log_queue
@@ -42,6 +41,8 @@ def process(conf):
 
     repository_enabled = conf['repository']['enabled']
     repository_url = conf['repository']['url']
+    repository_manifest = conf['repository']['manifest']
+    repository_gpg_verify = conf['repository']['gpg_verify']
 
     queue_handler = QueueHandler(log_queue)
     logger = logging.getLogger('margaritashotgun')
@@ -65,15 +66,11 @@ def process(conf):
         if lime_module is None:
             kernel_version = host.kernel_version()
             if repository_enabled:
-                repo = Repository(repository_url)
-                match = repo.search_modules(kernel_version)
-                if match is not None:
-                    lime_module = repo.fetch_module(match)
-                    host.upload_module(lime_module)
-                else:
-                    raise KernelModuleNotFoundError(kernel_version, repo.url)
+                repo = Repository(repository_url, repository_gpg_verify)
+                repo.init_gpg()
+                lime_module = repo.fetch(kernel_version, repository_manifest)
+                host.upload_module(lime_module)
             else:
-                # TODO: prompt user to search repository when running interactively
                 raise KernelModuleNotProvidedError(kernel_version)
         else:
             host.upload_module(lime_module, remote_module_path)
@@ -84,6 +81,7 @@ def process(conf):
         if lime_loaded:
             result = host.capture_memory(dest, filename, bucket, progressbar)
         else:
+            logger.debug("lime failed to load on {0}".format(remote_addr))
             result = False
 
         logger.removeHandler(queue_handler)
@@ -91,16 +89,21 @@ def process(conf):
         host.cleanup()
 
         return (remote_addr, result)
-    except KeyboardInterrupt:
+    except SSHConnectionError as ex:
+        logger.error(ex)
+        logger.removeHandler(queue_handler)
+        queue_handler.close()
+        return (remote_addr, False)
+    except KeyboardInterrupt as ex:
         logger.removeHandler(queue_handler)
         queue_handler.close()
         host.cleanup()
         return (remote_addr, False)
-    except Exception as ex:
+    except (SSHCommandError, Exception) as ex:
+        logger.error(ex)
         logger.removeHandler(queue_handler)
         queue_handler.close()
         host.cleanup()
-        logger.critical(ex)
         return (remote_addr, False)
 
 class Host():
@@ -118,6 +121,7 @@ class Host():
         self.shell = RemoteShell()
         self.commands = Commands
         self.tunnel = SSHTunnel()
+        self.net_parser = parser.ProcNetTcpParser()
 
     def connect(self, username, password, key, address, port, jump_host):
         """
@@ -204,12 +208,12 @@ class Host():
                                                           listen_port)
         lime_loaded = False
         while tries < max_tries and lime_loaded is False:
-            lime_loaded = self.check_for_lime(pattern, listen_port)
+            lime_loaded = self.check_for_lime(pattern)
             tries = tries + 1
             time.sleep(wait)
         return lime_loaded
 
-    def check_for_lime(self, pattern, listen_port):
+    def check_for_lime(self, pattern):
         """
         Check to see if LiME has loaded on the remote system
 
@@ -218,14 +222,19 @@ class Host():
         :type listen_port: int
         :param listen_port: port LiME is listening for connections on
         """
-        check = self.commands.lime_check.value.format(listen_port)
+        check = self.commands.lime_check.value
+        lime_loaded = False
         result = self.shell.execute(check)
         stdout = self.shell.decode(result['stdout'])
-        stderr = self.shell.decode(result['stderr'])
-        if pattern in stdout:
-            return True
-        else:
-            return False
+        connections = self.net_parser.parse(stdout)
+
+        for conn in connections:
+            local_addr, remote_addr = conn
+            if local_addr == pattern:
+                lime_loaded = True
+                break
+
+        return lime_loaded
 
     def upload_module(self, local_path=None, remote_path="/tmp/lime.ko"):
         """

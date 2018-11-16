@@ -2,7 +2,6 @@
 *.DS_Store
 *.pyc
 *.lime
-*.yml
 
 .Python
 env/
@@ -32,3 +31,4 @@ docs/_build
 .vagrant
 *.ko
 *.log
+!tests/files/*.yml
